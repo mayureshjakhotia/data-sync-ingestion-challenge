@@ -488,12 +488,12 @@ async function ingestStream(
   tokenHeader?: string | null
 ): Promise<void> {
   const FEED_LIMIT = 5000;
-  const FEED_PACE_MS = 300; // aggressive — single worker, no contention
+  const FEED_PACE_MS = 600;
   // Target gaps: Jan 25-30 tail (worker 5 underperformed) + full sweep for stragglers
   const TIME_MIN = 1766672280000;
   const TIME_MAX = 1769825520000;
   const TIME_RANGE = TIME_MAX - TIME_MIN;
-  const NUM_WORKERS = 2;
+  const NUM_WORKERS = 6;
 
   console.log(`[ingest] STRATEGY: Feed endpoint — ${(TIME_RANGE/86400000).toFixed(1)}-day window, ${NUM_WORKERS} parallel workers`);
   console.log(`[ingest]   since=${TIME_MIN} until=${TIME_MAX}`);
@@ -632,11 +632,16 @@ async function ingestStream(
     console.log(`[feed-${id}] Finished: fetched=${fetched}`);
   }
 
-  // Single worker, no time filter — paginate through ALL 3M events to find the 42k gaps
-  // Feed returns DESC. Need to reach page 590+ to find missing events at the oldest end.
-  // With 1 worker: no 429 contention, max ~50 req/min = ~250k events/min = 12 min to 3M
+  // Parallel time-partitioned feed workers
+  // Events span Dec 25, 2025 to Jan 30, 2026 (~36 days)
+  // Split into 6 shards so each worker covers ~6 days
   const workers: Promise<void>[] = [];
-  workers.push(feedRangeWorker(0, 0, 0)); // no time filter
+  const sliceSize = Math.ceil(TIME_RANGE / NUM_WORKERS);
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    const since = TIME_MIN + i * sliceSize;
+    const until = Math.min(TIME_MIN + (i + 1) * sliceSize, TIME_MAX);
+    workers.push(feedRangeWorker(i, since, until));
+  }
 
   await Promise.all(workers);
 
@@ -1374,13 +1379,16 @@ export async function runIngestion(): Promise<void> {
 
     if (discovery.streamEndpoint) {
       // BEST: Feed endpoint + dual-pool cursors simultaneously (3 separate rate limit pools!)
-      console.log("[ingest] Running FEED endpoint only (single worker, max throughput)");
-      await ingestStream(
-        discovery.streamEndpoint,
-        discovery.streamExpiresIn,
-        discovery.streamToken,
-        discovery.streamTokenHeader
-      );
+      console.log("[ingest] Running FEED + dual-pool cursors simultaneously for 3 separate rate limit pools");
+      await Promise.all([
+        ingestStream(
+          discovery.streamEndpoint,
+          discovery.streamExpiresIn,
+          discovery.streamToken,
+          discovery.streamTokenHeader
+        ),
+        ingestDualPoolCursors(discovery),
+      ]);
     } else if (discovery.dualRateLimitPools) {
       await ingestDualPoolCursors(discovery);
     } else if (discovery.offsetWorks) {
