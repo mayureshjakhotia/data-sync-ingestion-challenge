@@ -30,9 +30,9 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
       API_BASE_URL: http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1
       TARGET_API_KEY: ${TARGET_API_KEY:-}
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
-      BATCH_SIZE: ${BATCH_SIZE:-1000}
-      MAX_IN_FLIGHT: ${MAX_IN_FLIGHT:-40}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      BATCH_SIZE: ${BATCH_SIZE:-5000}
+      MAX_IN_FLIGHT: ${MAX_IN_FLIGHT:-5}
       AUTO_SUBMIT: ${AUTO_SUBMIT:-false}
       GITHUB_REPO: ${GITHUB_REPO:-}
       ID_ONLY: "true"

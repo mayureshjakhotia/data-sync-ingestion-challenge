@@ -65,20 +65,24 @@ async function main(): Promise<void> {
     console.log("[main] Initializing database...");
     await initDb();
 
-    // Step 2: Validate API key
-    console.log("[main] Validating API key...");
-    try {
-      const testResult = await apiRequest("/events?limit=1");
-      console.log(`[main] API key validated (status: ${testResult.statusCode})`);
-    } catch (err) {
-      console.error("[main] API key validation failed:", String(err).substring(0, 300));
-      console.error("[main] Please check your TARGET_API_KEY environment variable.");
-      process.exit(1);
-    }
-
-    // Step 3: Check current state
+    // Step 2: Check current state first (skip API validation to save rate limit)
     const existingCount = await getIngestedCount();
     console.log(`[main] Existing events in DB: ${existingCount}`);
+
+    if (existingCount === 0) {
+      // Only validate API key on fresh start
+      console.log("[main] Validating API key...");
+      try {
+        const testResult = await apiRequest("/events?limit=1", { authMethod: "header" });
+        console.log(`[main] API key validated (status: ${testResult.statusCode})`);
+      } catch (err) {
+        console.error("[main] API key validation failed:", String(err).substring(0, 300));
+        console.error("[main] Please check your TARGET_API_KEY environment variable.");
+        process.exit(1);
+      }
+    } else {
+      console.log("[main] Skipping API validation (resuming with existing data)");
+    }
 
     // Step 4: Run ingestion
     if (existingCount < 3_000_000) {

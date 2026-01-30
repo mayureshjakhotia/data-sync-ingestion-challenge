@@ -9,6 +9,23 @@ Ingest **3,000,000 events** from a remote API into PostgreSQL and submit all eve
 - **Verification requirement:** Solution must work from scratch on a clean Linux machine with only Docker installed. Must be fully automated — no manual intervention, pauses, or restarts.
 - **"If you feel limited by the API, keep pushing. There's always a faster way."**
 
+## SESSION STATE FILE — `.claude-state.json`
+**Every new Claude session MUST read this file first.** It tracks cross-session state:
+```json
+{
+  "sessionStart": "ISO timestamp when first Claude session started",
+  "apiKeyFirstUsed": "ISO timestamp when API key was first used (3hr timer starts)",
+  "apiKeyExpiresAt": "ISO timestamp when API key expires",
+  "submissionsUsed": 0,
+  "submissionsMax": 5,
+  "githubRepo": "https://github.com/mayureshjakhotia/data-sync-ingestion-challenge",
+  "notes": ["any important observations from previous sessions"]
+}
+```
+- **Update this file** when: API key is first used, a submission is made, important discoveries happen
+- **Read this file** at the start of every session to know remaining time and submissions
+- Located at project root: `.claude-state.json` (gitignored)
+
 ## CORE REQUIREMENTS (from README)
 1. **Connect** to the DataSync API
 2. **Extract** ALL events from the system (3,000,000)
@@ -131,8 +148,8 @@ sh run-ingestion.sh
 | `/api/v1/events/count` | GET | Yes | Event count |
 | `/api/v1/submissions` | GET/POST | Yes | GET: check submissions. POST: submit IDs (text/plain, one per line) + `?github_repo=URL` |
 | `/internal/dashboard/stream-access` | POST | Yes | Returns `{ streamAccess: { endpoint, token, tokenHeader, expiresIn } }` |
-| `/internal/stats` | GET | No | System stats (counts, distributions, cache info) |
-| `/internal/health` | GET | No | DB + Redis health |
+| `/internal/stats` | GET | **Yes** | System stats (counts, distributions, cache info) — requires API key |
+| `/internal/health` | GET | No | DB + Redis health (no auth needed) |
 
 ### Data Model (from /internal/stats)
 - **3,000,000 events** across **8 types**: page_view (1.05M), click (749K), api_call (300K), form_submit (300K), scroll (150K), purchase (150K), error (150K), video_play (150K)

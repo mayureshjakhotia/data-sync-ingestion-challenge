@@ -27,6 +27,7 @@ import {
   waitForRateLimit,
   acquireSlot,
   releaseSlot,
+  getHostBaseUrl,
   AuthMethod,
   EventsResponse,
   RateLimitInfo,
@@ -336,7 +337,7 @@ let insertFlushPromise: Promise<void> | null = null;
 
 function enqueueIds(ids: string[], strategy?: string): void {
   if (ids.length > 0) {
-    walAppend(ids); // WAL first — survives crashes
+    // Skip WAL writes — DB has ON CONFLICT DO NOTHING, and WAL recovery is slow on restart
     globalEnqueued += ids.length;
     insertQueue.push(ids);
     throughputTracker.record(ids.length, strategy || "unknown");
@@ -346,35 +347,43 @@ function enqueueIds(ids: string[], strategy?: string): void {
   }
 }
 
+const NUM_FLUSHERS = 8; // parallel DB insert workers
+
 function startFlushLoop(): void {
   if (insertFlushing) return;
   insertFlushing = true;
-  insertFlushPromise = (async () => {
-    while (insertQueue.length > 0 || !shuttingDown) {
-      if (insertQueue.length === 0) {
-        await sleep(10);
-        // Break if queue is empty and no more data expected
-        if (insertQueue.length === 0 && shuttingDown) break;
-        continue;
+
+  // Launch N parallel flusher coroutines
+  const flushers = Array.from({ length: NUM_FLUSHERS }, (_, i) =>
+    (async () => {
+      while (insertQueue.length > 0 || !shuttingDown) {
+        if (insertQueue.length === 0) {
+          await sleep(10);
+          if (insertQueue.length === 0 && shuttingDown) break;
+          continue;
+        }
+        // Each flusher grabs up to 5 batches
+        const batches: string[][] = [];
+        while (insertQueue.length > 0 && batches.length < 5) {
+          batches.push(insertQueue.shift()!);
+        }
+        if (batches.length === 0) continue;
+        const combined = batches.flat();
+        try {
+          const inserted = await batchInsertIdsWithRetry(combined);
+          globalIngested += inserted;
+        } catch (err) {
+          console.error(`[flush-${i}] Insert error: ${String(err).substring(0, 200)}`);
+          insertQueue.unshift(combined);
+          await sleep(500);
+        }
       }
-      // Drain up to 10 batches at once for efficiency
-      const batches: string[][] = [];
-      while (insertQueue.length > 0 && batches.length < 10) {
-        batches.push(insertQueue.shift()!);
-      }
-      const combined = batches.flat();
-      try {
-        const inserted = await batchInsertIdsWithRetry(combined);
-        globalIngested += inserted;
-      } catch (err) {
-        console.error(`[flush] Insert error: ${String(err).substring(0, 200)}`);
-        // Re-queue on failure
-        insertQueue.unshift(combined);
-        await sleep(500);
-      }
-    }
+    })()
+  );
+
+  insertFlushPromise = Promise.all(flushers).then(() => {
     insertFlushing = false;
-  })();
+  });
 }
 
 async function drainInsertQueue(): Promise<void> {
@@ -467,154 +476,176 @@ async function ingestAll(endpoint: string): Promise<boolean> {
 // Layer -1: Streaming Endpoint (fastest - bypasses rate limits)
 // =============================================================================
 
+/**
+ * Primary ingestion via the feed endpoint with TIME-BASED PARTITIONING.
+ * The feed supports ?since=TIMESTAMP&until=TIMESTAMP for non-overlapping ranges.
+ * Each worker gets a unique time slice — zero overlap, maximum parallelism.
+ */
 async function ingestStream(
   streamUrl: string,
   expiresIn: number,
   token?: string | null,
   tokenHeader?: string | null
 ): Promise<void> {
-  console.log(`[ingest] STRATEGY: Stream endpoint -> ${streamUrl} (expires in ${expiresIn}s)`);
+  const FEED_LIMIT = 5000;
+  const FEED_PACE_MS = 300; // aggressive — single worker, no contention
+  // Target gaps: Jan 25-30 tail (worker 5 underperformed) + full sweep for stragglers
+  const TIME_MIN = 1766672280000;
+  const TIME_MAX = 1769825520000;
+  const TIME_RANGE = TIME_MAX - TIME_MIN;
+  const NUM_WORKERS = 2;
 
-  let cursor: string | undefined;
-  let consecutiveErrors = 0;
-  let consecutiveEmpty = 0;
-  const maxRetries = 5;
+  console.log(`[ingest] STRATEGY: Feed endpoint — ${(TIME_RANGE/86400000).toFixed(1)}-day window, ${NUM_WORKERS} parallel workers`);
+  console.log(`[ingest]   since=${TIME_MIN} until=${TIME_MAX}`);
+  console.log(`[ingest]   Already have ${globalIngested} events`);
+  console.log(`[ingest]   Feed URL: ${streamUrl}`);
+
+  let currentToken: string | null = token ?? null;
+  let currentTokenHeader: string | null = tokenHeader ?? null;
+  let currentStreamUrl: string = streamUrl;
   let streamDeadline = Date.now() + (expiresIn - 30) * 1000;
-  let currentToken = token;
-  let currentTokenHeader = tokenHeader;
 
-  while (!shuttingDown && globalEnqueued < TOTAL_EVENTS) {
-    // Renew stream access if approaching expiry
-    if (Date.now() > streamDeadline) {
-      console.log("[stream] Stream token expiring, requesting renewal...");
-      const renewed = await requestStreamAccess();
-      if (renewed) {
-        streamUrl = renewed.endpoint;
-        streamDeadline = Date.now() + (renewed.expiresIn - 30) * 1000;
-        currentToken = renewed.token;
-        currentTokenHeader = renewed.tokenHeader;
-        console.log(`[stream] Renewed stream endpoint: ${streamUrl} (expires in ${renewed.expiresIn}s)`);
-      } else {
-        console.log("[stream] Could not renew stream, falling back to other strategies");
-        return ingestFallback();
-      }
+  async function getToken(): Promise<{ token: string | null; tokenHeader: string | null; streamUrl: string }> {
+    if (Date.now() < streamDeadline && currentToken) {
+      return { token: currentToken, tokenHeader: currentTokenHeader, streamUrl: currentStreamUrl };
+    }
+    console.log("[feed] Token expiring, requesting renewal...");
+    const renewed = await requestStreamAccess();
+    if (renewed) {
+      currentToken = renewed.token;
+      currentTokenHeader = renewed.tokenHeader;
+      currentStreamUrl = renewed.endpoint;
+      streamDeadline = Date.now() + (renewed.expiresIn - 30) * 1000;
+      console.log(`[feed] Renewed token, expires in ${renewed.expiresIn}s`);
+    }
+    return { token: currentToken, tokenHeader: currentTokenHeader, streamUrl: currentStreamUrl };
+  }
+
+  // Feed worker with time-range constraint
+  async function feedRangeWorker(id: number, since: number, until: number): Promise<void> {
+    let cursor: string | undefined;
+    let hasMore = true;
+    let fetched = 0;
+    let consecutiveErrors = 0;
+    let lastRequestTime = 0;
+
+    if (since > 0 && until > 0) {
+      console.log(`[feed-${id}] Range: since=${since} until=${until} (${((until - since) / 3600000).toFixed(1)}h)`);
+    } else if (until > 0) {
+      console.log(`[feed-${id}] Until only: until=${until} (oldest events first)`);
+    } else {
+      console.log(`[feed-${id}] Full sweep (no time filter)`);
     }
 
-    try {
-      const response = await fetchStream(streamUrl, cursor, undefined, currentToken, currentTokenHeader);
-
-      if (response.statusCode >= 400) {
-        consecutiveErrors++;
-        console.log(`[stream] Error ${response.statusCode}: ${response.body.substring(0, 200)}`);
-        if (consecutiveErrors >= maxRetries) {
-          console.log("[stream] Too many errors, falling back");
-          return ingestFallback();
-        }
-        await sleep(Math.min(1000 * Math.pow(2, consecutiveErrors), 30000));
-        continue;
-      }
-
-      let parsed: any;
+    while (hasMore && !shuttingDown && globalIngested < TOTAL_EVENTS) {
       try {
-        parsed = JSON.parse(response.body);
-      } catch {
-        // Could be NDJSON or SSE
-        const body = response.body;
+        const now = Date.now();
+        const elapsed = now - lastRequestTime;
+        if (elapsed < FEED_PACE_MS) {
+          await sleep(FEED_PACE_MS - elapsed);
+        }
 
-        // Check for SSE format (lines starting with "data:")
-        if (body.includes("data:")) {
-          const ids = parseSSEData(body);
-          if (ids.length > 0) {
-            enqueueIds(ids, "sse");
-            consecutiveErrors = 0;
-            consecutiveEmpty = 0;
-            if (globalIngested % PROGRESS_INTERVAL < ids.length) {
-              logProgress("sse", globalIngested, `batch=${ids.length}`);
-            }
-          }
+        const t = await getToken();
+        // Build URL with optional since/until params AND limit
+        const sep = t.streamUrl.includes("?") ? "&" : "?";
+        let baseUrl = `${t.streamUrl}${sep}limit=${FEED_LIMIT}`;
+        if (since > 0) baseUrl += `&since=${since}`;
+        if (until > 0) baseUrl += `&until=${until}`;
+
+        const response = await fetchStream(baseUrl, cursor, undefined, t.token, t.tokenHeader);
+        lastRequestTime = Date.now();
+
+        if (response.statusCode === 429) {
+          // Read Retry-After or X-RateLimit-Reset header
+          const rawRetry = response.headers?.["retry-after"] || response.headers?.["x-ratelimit-reset"];
+          const retryAfter = Array.isArray(rawRetry) ? rawRetry[0] : rawRetry;
+          const waitMs = retryAfter ? (parseInt(retryAfter, 10) * 1000 + id * 500) : (5000 + id * 1000);
+          console.log(`[feed-${id}] 429 — waiting ${(waitMs/1000).toFixed(1)}s (retry-after=${retryAfter || "none"})`);
+          await sleep(waitMs);
           continue;
         }
 
-        // NDJSON
-        const lines = body.split("\n").filter((l) => l.trim());
-        if (lines.length > 0) {
-          const ids: string[] = [];
-          for (const line of lines) {
-            try {
-              const event = JSON.parse(line);
-              ids.push(extractId(event));
-            } catch {
-              // skip malformed
-            }
+        if (response.statusCode >= 400) {
+          consecutiveErrors++;
+          console.log(`[feed-${id}] Error ${response.statusCode}: ${response.body.substring(0, 200)}`);
+          if (response.statusCode === 403) {
+            streamDeadline = 0;
+            await sleep(1000);
           }
-          const validIds = ids.filter((id) => id && id !== "undefined" && id !== "null");
-          if (validIds.length > 0) {
-            enqueueIds(validIds, "stream-ndjson");
-            consecutiveErrors = 0;
-            consecutiveEmpty = 0;
-            logProgress("stream", globalIngested, `batch=${validIds.length}`);
+          if (response.statusCode === 502 || response.statusCode === 504) {
+            // Gateway errors — transient, just retry after a pause
+            await sleep(3000);
+            continue;
           }
+          if (consecutiveErrors >= 20) break; // More retries before giving up
+          await sleep(Math.min(1000 * consecutiveErrors, 10000));
           continue;
         }
-        consecutiveErrors++;
-        if (consecutiveErrors >= maxRetries) return ingestFallback();
-        await sleep(1000 * consecutiveErrors);
-        continue;
-      }
 
-      const events: Record<string, unknown>[] = Array.isArray(parsed)
-        ? parsed
-        : parsed.data || parsed.events || [];
+        const parsed = JSON.parse(response.body);
+        const events: Record<string, unknown>[] = parsed.data || [];
 
-      // Log schema from first batch received via stream
-      logEventSchema(events, parsed.nextCursor || parsed.cursor);
-
-      if (events.length === 0) {
-        consecutiveEmpty++;
-        if (consecutiveEmpty >= 5) {
-          console.log("[stream] No more data from stream");
+        if (events.length === 0) {
+          console.log(`[feed-${id}] Exhausted time range (${fetched} events)`);
           break;
         }
-        await sleep(500);
-        continue;
-      }
 
-      const ids = extractValidIds(events);
-      enqueueIds(ids, "stream");
+        logEventSchema(events, parsed.pagination?.nextCursor || parsed.nextCursor);
 
-      cursor = parsed.nextCursor || parsed.cursor;
-      consecutiveErrors = 0;
-      consecutiveEmpty = 0;
+        const ids = extractValidIds(events);
+        enqueueIds(ids, "feed");
 
-      if (globalIngested % PROGRESS_INTERVAL < events.length) {
-        logProgress("stream", globalIngested, `batch=${events.length}`);
-      }
+        hasMore = parsed.pagination?.hasMore ?? parsed.hasMore ?? false;
+        const newCursor = parsed.pagination?.nextCursor || parsed.nextCursor;
+        if (newCursor !== cursor) {
+          cursor = newCursor;
+        }
+        fetched += events.length;
+        consecutiveErrors = 0;
 
-      if (globalIngested % 50000 < events.length) {
-        await saveProgress(cursor || null, globalIngested, "running", "stream");
-      }
+        reportWorkerAlive(`feed-${id}`, fetched);
 
-      if (!cursor && !parsed.hasMore) {
-        console.log("[stream] Stream exhausted (no cursor, no hasMore)");
-        break;
+        if (fetched % PROGRESS_INTERVAL < events.length) {
+          logProgress(`feed-${id}`, fetched, `batch=${events.length}`);
+        }
+
+        if (fetched % 50000 < events.length) {
+          await saveProgress(cursor || null, globalIngested, "running", `feed-${id}`);
+        }
+
+        if (!cursor && !hasMore) break;
+      } catch (err) {
+        consecutiveErrors++;
+        const errStr = String(err);
+        console.error(`[feed-${id}] Error (${consecutiveErrors}):`, errStr.substring(0, 200));
+
+        if (errStr.includes("cursor") || errStr.includes("expired")) {
+          console.log(`[feed-${id}] Cursor expired, clearing cursor to continue in same range`);
+          cursor = undefined;
+        }
+
+        if (consecutiveErrors >= 10) break;
+        await sleep(Math.min(1000 * consecutiveErrors, 10000));
       }
-    } catch (err) {
-      consecutiveErrors++;
-      console.error(`[stream] Error (${consecutiveErrors}):`, String(err).substring(0, 200));
-      if (consecutiveErrors >= maxRetries) {
-        console.log("[stream] Too many errors, falling back");
-        return ingestFallback();
-      }
-      await sleep(Math.min(1000 * Math.pow(2, consecutiveErrors), 30000));
     }
+
+    console.log(`[feed-${id}] Finished: fetched=${fetched}`);
   }
+
+  // Single worker, no time filter — paginate through ALL 3M events to find the 42k gaps
+  // Feed returns DESC. Need to reach page 590+ to find missing events at the oldest end.
+  // With 1 worker: no 429 contention, max ~50 req/min = ~250k events/min = 12 min to 3M
+  const workers: Promise<void>[] = [];
+  workers.push(feedRangeWorker(0, 0, 0)); // no time filter
+
+  await Promise.all(workers);
 
   await drainInsertQueue();
   await analyzeTable();
   const finalCount = await getExactCount();
   globalIngested = finalCount;
-  console.log(`[ingest] Stream finished. DB count: ${finalCount}`);
-  await saveProgress(null, finalCount, "completed", "stream");
+  console.log(`[ingest] Feed finished. DB count: ${finalCount}`);
+  await saveProgress(null, finalCount, "completed", "feed");
 }
 
 // =============================================================================
@@ -748,23 +779,32 @@ async function typeWorker(
   let authMethod = preferredAuth;
   let consecutiveErrors = 0;
 
-  console.log(`[worker-${id}] Starting: type=${eventType}, auth=${authMethod}, limit=${limit}`);
+  // Pacing per auth method
+  const paceMs = authMethod === "query" ? 650 : 6200;
+  let lastRequestTime = 0;
+
+  console.log(`[worker-${id}] Starting: type=${eventType}, auth=${authMethod}, limit=${limit}, pace=${paceMs}ms`);
 
   while (hasMore && !shuttingDown) {
     try {
-      await waitForRateLimit();
+      const now = Date.now();
+      const elapsed = now - lastRequestTime;
+      if (elapsed < paceMs) {
+        await sleep(paceMs - elapsed);
+      }
+
       await acquireSlot();
       let events: EventsResponse;
       let rateLimit: RateLimitInfo;
       let usedAuth: AuthMethod;
       try {
-        authMethod = pickAuthMethod(authMethod);
         ({ events, rateLimit, authMethod: usedAuth } = await fetchEvents(
           cursor,
           limit,
           { [filterParam]: eventType },
           authMethod
         ));
+        lastRequestTime = Date.now();
       } finally {
         releaseSlot();
       }
@@ -785,8 +825,10 @@ async function typeWorker(
       cursor = events.nextCursor;
       fetched += events.data.length;
 
-      if (rateLimit.remaining <= 2) {
-        authMethod = authMethod === "header" ? "query" : "header";
+      if (rateLimit.remaining <= 1) {
+        const waitMs = Math.max(rateLimit.reset * 1000, 500);
+        console.log(`[worker-${id}] Rate limit low (${rateLimit.remaining}), waiting ${(waitMs/1000).toFixed(1)}s`);
+        await sleep(waitMs);
       }
 
       consecutiveErrors = 0;
@@ -813,15 +855,54 @@ async function typeWorker(
       }
 
       if (String(err).includes("cursor") || String(err).includes("expired")) {
-        console.log(`[worker-${id}] Cursor expired, restarting from beginning`);
-        cursor = undefined;
+        console.log(`[worker-${id}] Cursor expired after ${fetched} events, stopping worker`);
+        break;
       }
 
-      await sleep(1000 * consecutiveErrors);
+      await sleep(Math.min(1000 * consecutiveErrors, 10000));
     }
   }
 
   console.log(`[worker-${id}] Finished ${eventType}: fetched=${fetched}`);
+}
+
+// =============================================================================
+// Layer 1.5: Dual-Pool Cursor Strategy (optimal for separate rate limit pools)
+// Two dedicated workers: one for header auth (10/60s), one for query auth (5/3s)
+// =============================================================================
+
+async function ingestDualPoolCursors(discovery: DiscoveryResult): Promise<void> {
+  const { maxLimit } = discovery;
+  console.log(`[ingest] STRATEGY: Dual-pool cursors (2 workers, limit=${maxLimit})`);
+  console.log(`[ingest]   Worker 0: query auth (5 req / 3s = ~100 req/min → ~500K evt/min)`);
+  console.log(`[ingest]   Worker 1: header auth (10 req / 60s = ~10 req/min → ~50K evt/min)`);
+
+  // Seed worker 1 cursor: fetch one page to get a staggered starting point
+  let worker1Cursor: string | undefined;
+  try {
+    const seed = await fetchEvents(undefined, maxLimit, undefined, "header");
+    if (seed.events.data && seed.events.data.length > 0) {
+      const ids = extractValidIds(seed.events.data);
+      enqueueIds(ids, "dual-seed");
+      worker1Cursor = seed.events.nextCursor;
+      console.log(`[ingest] Seeded worker 1 cursor: ${worker1Cursor?.substring(0, 20)}... (saved ${ids.length} events)`);
+    }
+  } catch (err) {
+    console.log(`[ingest] Seeding failed, both start from beginning: ${String(err).substring(0, 100)}`);
+  }
+
+  // Launch both workers — they have dedicated, non-overlapping auth pools
+  await Promise.all([
+    cursorChainWorker(0, maxLimit, "query", undefined),
+    cursorChainWorker(1, maxLimit, "header", worker1Cursor),
+  ]);
+
+  await drainInsertQueue();
+  await analyzeTable();
+  const finalCount = await getExactCount();
+  globalIngested = finalCount;
+  console.log(`[ingest] Dual-pool cursors finished. DB count: ${finalCount}`);
+  await saveProgress(null, finalCount, "completed", "dual-pool-cursors");
 }
 
 // =============================================================================
@@ -887,20 +968,31 @@ async function cursorChainWorker(
   let authMethod = preferredAuth;
   let consecutiveErrors = 0;
 
+  // Pacing: query auth = 5 req / 3s → one every 650ms; header auth = 10 req / 60s → one every 6200ms
+  const paceMs = authMethod === "query" ? 650 : 6200;
+  let lastRequestTime = 0;
+
+  console.log(`[chain-${id}] Starting: auth=${authMethod}, pace=${paceMs}ms, limit=${limit}`);
+
   while (hasMore && !shuttingDown && globalEnqueued < TOTAL_EVENTS) {
     try {
-      await waitForRateLimit();
+      // Pace requests to stay within rate limit budget
+      const now = Date.now();
+      const elapsed = now - lastRequestTime;
+      if (elapsed < paceMs) {
+        await sleep(paceMs - elapsed);
+      }
+
       await acquireSlot();
       let events: EventsResponse;
       let rateLimit: RateLimitInfo;
       let usedAuth: AuthMethod;
       try {
-        authMethod = pickAuthMethod(authMethod);
         ({ events, rateLimit, authMethod: usedAuth } = await fetchEvents(cursor, limit, undefined, authMethod));
+        lastRequestTime = Date.now();
       } finally {
         releaseSlot();
       }
-      authMethod = usedAuth;
 
       if (!events.data || events.data.length === 0) break;
 
@@ -913,8 +1005,11 @@ async function cursorChainWorker(
       cursor = events.nextCursor;
       fetched += events.data.length;
 
-      if (rateLimit.remaining <= 2) {
-        authMethod = authMethod === "header" ? "query" : "header";
+      // If rate limited, wait for reset
+      if (rateLimit.remaining <= 1) {
+        const waitMs = Math.max(rateLimit.reset * 1000, 500);
+        console.log(`[chain-${id}] Rate limit low (${rateLimit.remaining}), waiting ${(waitMs/1000).toFixed(1)}s`);
+        await sleep(waitMs);
       }
 
       consecutiveErrors = 0;
@@ -927,9 +1022,10 @@ async function cursorChainWorker(
       consecutiveErrors++;
       if (consecutiveErrors >= 10) break;
       if (String(err).includes("cursor") || String(err).includes("expired")) {
-        cursor = undefined;
+        console.log(`[chain-${id}] Cursor expired after ${fetched} events, stopping worker (avoid re-fetching duplicates)`);
+        break;
       }
-      await sleep(1000 * consecutiveErrors);
+      await sleep(Math.min(1000 * consecutiveErrors, 10000));
     }
   }
 
@@ -1183,78 +1279,84 @@ export async function runIngestion(): Promise<void> {
     console.log(`[ingest] Resuming from ${globalIngested} existing events`);
   }
 
-  // Phase 0: Recover any IDs from WAL file that didn't make it to DB
-  const walRecovered = await recoverFromWal();
-  if (walRecovered > 0) {
-    globalIngested = await getExactCount();
-    globalEnqueued = globalIngested;
-    console.log(`[ingest] After WAL recovery: ${globalIngested} events in DB`);
-    if (globalIngested >= TOTAL_EVENTS) {
-      console.log("[ingest] WAL recovery completed the job!");
-      return;
-    }
+  // Skip WAL recovery — too slow on large WAL files, DB already has events via ON CONFLICT DO NOTHING
+  console.log(`[ingest] Skipping WAL recovery (DB already has ${globalIngested} events)`);
+
+  // Skip full discovery if resuming with >50% events — go straight to feed
+  const skipDiscovery = globalIngested > TOTAL_EVENTS * 0.5;
+  let discovery: DiscoveryResult;
+
+  if (skipDiscovery) {
+    console.log(`[ingest] SKIPPING DISCOVERY — already have ${globalIngested} events (${((globalIngested/TOTAL_EVENTS)*100).toFixed(1)}%)`);
+    console.log(`[ingest] Going straight to feed endpoint...`);
+    // Request stream access directly
+    const streamAccess = await requestStreamAccess();
+    discovery = {
+      maxLimit: 5000,
+      typeFilterWorks: true,
+      typeFilterParam: "type",
+      bulkEndpoint: null,
+      parallelCursorsWork: true,
+      eventTypes: ["page_view", "click", "api_call", "form_submit", "scroll", "purchase", "error", "video_play"],
+      streamEndpoint: streamAccess?.endpoint || null,
+      streamExpiresIn: streamAccess?.expiresIn || 300,
+      streamToken: streamAccess?.token || null,
+      streamTokenHeader: streamAccess?.tokenHeader || null,
+      allEndpoint: null,
+      idsEndpoint: null,
+      batchEndpoint: null,
+      dualRateLimitPools: true,
+      offsetWorks: false,
+      offsetParam: "offset",
+      timeRange: null,
+      rateLimitBudget: { headerLimit: 10, headerWindow: 60, headerRemaining: 10, queryLimit: 5, queryWindow: 60, queryRemaining: 5, separatePools: true },
+      sseWorks: false,
+      timeParamWorks: false,
+      timeParam: "since",
+      customHeaders: null,
+    };
+    cachedDiscovery = discovery;
+  } else {
+    // Phase 1: Lean discovery
+    console.log("[ingest] Phase 1: Discovery...");
+    discovery = await quickDiscover();
+    cachedDiscovery = discovery;
+
+    console.log("=== DISCOVERY SUMMARY ===");
+    console.log(`  Type filter:       ${discovery.typeFilterWorks ? `YES (param: ${discovery.typeFilterParam})` : "no"}`);
+    console.log(`  Max page size:     ${discovery.maxLimit}`);
+    console.log(`  Dual rate pools:   ${discovery.dualRateLimitPools ? "YES" : "no"}`);
+    console.log(`  Event types:       ${discovery.eventTypes.join(", ")}`);
   }
 
-  // Phase 1: Quick discovery — probe API to find fastest endpoints
-  console.log("[ingest] Phase 1: Quick discovery...");
-  const discovery = await quickDiscover();
-  cachedDiscovery = discovery;
-
-  // Log discovery summary so we can see what was found
-  console.log("=== DISCOVERY SUMMARY ===");
-  console.log(`  Stream endpoint:   ${discovery.streamEndpoint || "not found"}`);
-  console.log(`  Stream token:      ${discovery.streamToken ? "yes" : "no"}`);
-  console.log(`  Bulk endpoint:     ${discovery.bulkEndpoint || "not found"}`);
-  console.log(`  /events/all:       ${discovery.allEndpoint || "not found"}`);
-  console.log(`  /events/ids:       ${discovery.idsEndpoint || "not found"}`);
-  console.log(`  Type filter:       ${discovery.typeFilterWorks ? `YES (param: ${discovery.typeFilterParam})` : "no"}`);
-  console.log(`  Max page size:     ${discovery.maxLimit}`);
-  console.log(`  Offset pagination: ${discovery.offsetWorks ? `YES (param: ${discovery.offsetParam})` : "no"}`);
-  console.log(`  Time range:        ${discovery.timeRange ? `${discovery.timeRange.min} → ${discovery.timeRange.max}` : "not found"}`);
-  console.log(`  Parallel cursors:  ${discovery.parallelCursorsWork ? "yes" : "unknown"}`);
-  console.log(`  Dual rate pools:   ${discovery.dualRateLimitPools ? "YES" : "no"}`);
-  console.log(`  Event types:       ${discovery.eventTypes.join(", ")}`);
-
-  // Phase 1.5: Try instant fast-path endpoints (10s timeout each)
+  // Phase 1.5: Try instant fast-path endpoints
   let fastPathDone = false;
-  if (discovery.idsEndpoint) {
-    console.log("[ingest] Trying fast-path: /events/ids ...");
-    fastPathDone = await ingestAll(discovery.idsEndpoint);
-  }
-  if (!fastPathDone && discovery.allEndpoint) {
-    console.log("[ingest] Trying fast-path: /events/all ...");
-    fastPathDone = await ingestAll(discovery.allEndpoint);
-  }
-
-  if (fastPathDone) {
-    const count = await getExactCount();
-    globalIngested = count;
-    if (count >= TOTAL_EVENTS) {
-      console.log(`[ingest] Fast-path got all ${count} events!`);
-      // Skip to verification phase
-    } else {
-      console.log(`[ingest] Fast-path got ${count} events, need more. Continuing...`);
-      fastPathDone = false;
+  if (!skipDiscovery) {
+    if (discovery.idsEndpoint) {
+      console.log("[ingest] Trying fast-path: /events/ids ...");
+      fastPathDone = await ingestAll(discovery.idsEndpoint);
+    }
+    if (!fastPathDone && discovery.allEndpoint) {
+      console.log("[ingest] Trying fast-path: /events/all ...");
+      fastPathDone = await ingestAll(discovery.allEndpoint);
+    }
+    if (fastPathDone) {
+      const count = await getExactCount();
+      globalIngested = count;
+      if (count >= TOTAL_EVENTS) {
+        console.log(`[ingest] Fast-path got all ${count} events!`);
+      } else {
+        console.log(`[ingest] Fast-path got ${count} events, need more.`);
+        fastPathDone = false;
+      }
     }
   }
 
   if (!fastPathDone) {
-    // Pick strategy
-    let strategyName: string;
-    if (discovery.offsetWorks) {
-      strategyName = `parallel offset (param=${discovery.offsetParam}, limit=${discovery.maxLimit})`;
-    } else if (discovery.streamEndpoint) {
-      strategyName = "stream + parallel workers";
-    } else if (discovery.typeFilterWorks) {
-      strategyName = `parallel by type (${discovery.eventTypes.length} workers, limit=${discovery.maxLimit})`;
-    } else {
-      strategyName = `parallel cursor chains (limit=${discovery.maxLimit})`;
-    }
+    const strategyName = discovery.streamEndpoint
+      ? `FEED endpoint (${discovery.streamEndpoint})`
+      : `dual-pool cursor chains`;
     console.log(`  CHOSEN STRATEGY:   ${strategyName}`);
-    console.log(`  SSE works:         ${discovery.sseWorks ? "YES" : "no"}`);
-    console.log(`  Time param:        ${discovery.timeParamWorks ? `YES (${discovery.timeParam})` : "no"}`);
-    console.log(`  Custom headers:    ${discovery.customHeaders ? JSON.stringify(discovery.customHeaders) : "none"}`);
-    console.log(`  Rate budget:       ${discovery.rateLimitBudget ? `H:${discovery.rateLimitBudget.headerLimit}/${discovery.rateLimitBudget.headerWindow}s Q:${discovery.rateLimitBudget.queryLimit}/${discovery.rateLimitBudget.queryWindow}s` : "not measured"}`);
     console.log("=========================");
 
     // Initialize rate budget pacer if we have measurements
@@ -1270,10 +1372,19 @@ export async function runIngestion(): Promise<void> {
     // Phase 2: Execute — parallel workers are the primary path.
     console.log("[ingest] Phase 2: Executing strategy...");
 
-    if (discovery.offsetWorks) {
+    if (discovery.streamEndpoint) {
+      // BEST: Feed endpoint + dual-pool cursors simultaneously (3 separate rate limit pools!)
+      console.log("[ingest] Running FEED endpoint only (single worker, max throughput)");
+      await ingestStream(
+        discovery.streamEndpoint,
+        discovery.streamExpiresIn,
+        discovery.streamToken,
+        discovery.streamTokenHeader
+      );
+    } else if (discovery.dualRateLimitPools) {
+      await ingestDualPoolCursors(discovery);
+    } else if (discovery.offsetWorks) {
       await ingestParallelOffset(discovery);
-    } else if (discovery.streamEndpoint) {
-      await ingestParallelCombo(discovery);
     } else if (discovery.typeFilterWorks) {
       await ingestParallelByType(discovery);
     } else {

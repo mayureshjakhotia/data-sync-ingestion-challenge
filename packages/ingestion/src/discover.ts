@@ -178,10 +178,7 @@ async function probeApiShape(): Promise<void> {
  * Quick discovery - fires all probes in parallel for speed.
  */
 export async function quickDiscover(): Promise<DiscoveryResult> {
-  console.log("[discover] Running quick discovery...");
-
-  // FIRST: Deep inspection of the API — understand what we're dealing with
-  await probeApiShape();
+  console.log("[discover] Running lean discovery (conserving rate limit budget)...");
 
   const result: DiscoveryResult = {
     maxLimit: 1000,
@@ -197,113 +194,50 @@ export async function quickDiscover(): Promise<DiscoveryResult> {
     allEndpoint: null,
     idsEndpoint: null,
     batchEndpoint: null,
-    dualRateLimitPools: false,
+    dualRateLimitPools: true, // confirmed: header=10/60s, query=5/3s (separate pools)
     offsetWorks: false,
     offsetParam: "offset",
     timeRange: null,
-    rateLimitBudget: null,
+    rateLimitBudget: {
+      headerLimit: 10,
+      headerWindow: 60,
+      headerRemaining: 10,
+      queryLimit: 5,
+      queryWindow: 3,
+      queryRemaining: 5,
+      separatePools: true,
+    },
     sseWorks: false,
     timeParamWorks: false,
     timeParam: "since",
     customHeaders: null,
   };
 
-  // Run ALL probes in parallel for speed
+  // Phase 1: Single API call to inspect response shape + detect max page size
+  // Use header auth for the first call (it's the slow pool, save query auth for ingestion)
+  await probeApiShape();
+
+  // Phase 2: Minimal probes — only test what we need
+  // These use different auth or no-auth endpoints to preserve rate limit budget
   const [
-    bulkResult,
     limitAndTypeResult,
-    streamResult,
-    headerResult,
-    extraResult,
-    fastPathResult,
-    dualAuthResult,
-    offsetResult,
-    timeRangeResult,
-    rateBudgetResult,
-    customHeaderResult,
-    sseResult,
-    timeParamResult,
     dashboardResult,
+    dualAuthResult,
+    streamAccessResult,
   ] = await Promise.allSettled([
-    probeBulkEndpoints(),
     probeLimitAndTypeFilter(),
-    requestStreamAccess(),
-    inspectResponseHeaders(),
-    probeExtraFormats(),
-    probeFastPaths(),
+    probeDashboardAndBundle(),   // no auth needed for dashboard HTML + JS
     probeDualAuth(),
-    probeOffsetPagination(),
-    probeTimeRange(),
-    measureRateLimitBudget(),
-    probeCustomHeaders(),
-    probeSSE(),
-    probeTimeParams(),
-    probeDashboardAndBundle(),
+    requestStreamAccess(),       // get stream token for feed endpoint (no rate limits!)
   ]);
 
-  // Log any header hints found
-  if (headerResult.status === "fulfilled" && headerResult.value) {
-    const hints = headerResult.value;
-    if (hints.streamUrl) {
-      console.log(`[discover] Header hint - stream URL: ${hints.streamUrl}`);
-      if (!result.streamEndpoint) {
-        result.streamEndpoint = hints.streamUrl;
-        result.streamExpiresIn = 300;
-      }
-    }
-    if (hints.allHeaders) {
-      console.log(`[discover] Response headers from /events: ${hints.allHeaders}`);
-    }
-  }
-
-  // Stream endpoint
-  if (streamResult.status === "fulfilled" && streamResult.value) {
-    const sa = streamResult.value as StreamAccessResult;
-    result.streamEndpoint = sa.endpoint;
-    result.streamExpiresIn = sa.expiresIn;
-    result.streamToken = sa.token;
-    result.streamTokenHeader = sa.tokenHeader;
-    console.log(`[discover] Found STREAM endpoint: ${result.streamEndpoint} (expires in ${result.streamExpiresIn}s, token: ${sa.token ? "yes" : "no"})`);
-  }
-
-  // Fast paths: /events/all, /events/ids, /events/batch
-  if (fastPathResult.status === "fulfilled" && fastPathResult.value) {
-    const fp = fastPathResult.value;
-    if (fp.allEndpoint) {
-      result.allEndpoint = fp.allEndpoint;
-      console.log(`[discover] /events/all returned data!`);
-    }
-    if (fp.idsEndpoint) {
-      result.idsEndpoint = fp.idsEndpoint;
-      console.log(`[discover] /events/ids returned IDs!`);
-    }
-    if (fp.batchEndpoint) {
-      result.batchEndpoint = fp.batchEndpoint;
-      console.log(`[discover] /events/batch supports offset!`);
-    }
-  }
-
-  if (bulkResult.status === "fulfilled" && bulkResult.value) {
-    result.bulkEndpoint = bulkResult.value;
-    console.log(`[discover] Found bulk endpoint: ${result.bulkEndpoint}`);
-  }
-
-  // Limit/type info for fallback strategies
+  // Limit/type info
   if (limitAndTypeResult.status === "fulfilled") {
     const ltResult = limitAndTypeResult.value;
     result.maxLimit = ltResult.maxLimit;
     result.typeFilterWorks = ltResult.typeFilterWorks;
     result.typeFilterParam = ltResult.typeFilterParam;
     console.log(`[discover] Max limit: ${result.maxLimit}, type filter: ${result.typeFilterWorks} (param: ${result.typeFilterParam})`);
-  }
-
-  // Extra format probe results
-  if (extraResult.status === "fulfilled" && extraResult.value) {
-    const extra = extraResult.value;
-    if (extra.ndjsonWorks) console.log("[discover] NDJSON format supported!");
-    if (extra.fieldsWork) console.log("[discover] Sparse fields (?fields=id) supported!");
-    if (extra.totalCount > 0) console.log(`[discover] X-Total-Count: ${extra.totalCount}`);
-    if (extra.countEndpoint > 0) console.log(`[discover] /events/count: ${extra.countEndpoint}`);
   }
 
   // Dual-auth rate limit pools
@@ -314,60 +248,24 @@ export async function quickDiscover(): Promise<DiscoveryResult> {
     }
   }
 
-  // Offset pagination
-  if (offsetResult.status === "fulfilled" && offsetResult.value) {
-    result.offsetWorks = offsetResult.value.works;
-    result.offsetParam = offsetResult.value.param;
-    if (result.offsetWorks) {
-      console.log(`[discover] CONFIRMED: Offset pagination works (param: ${result.offsetParam})`);
-    }
+  // Stream access (feed endpoint — no rate limits!)
+  if (streamAccessResult.status === "fulfilled" && streamAccessResult.value) {
+    const sa = streamAccessResult.value;
+    result.streamEndpoint = sa.endpoint;
+    result.streamExpiresIn = sa.expiresIn;
+    result.streamToken = sa.token;
+    result.streamTokenHeader = sa.tokenHeader;
+    console.log(`[discover] Stream access: endpoint=${sa.endpoint}, expiresIn=${sa.expiresIn}s, tokenHeader=${sa.tokenHeader}`);
+  } else {
+    console.log(`[discover] Stream access not available: ${streamAccessResult.status === "rejected" ? streamAccessResult.reason : "null result"}`);
   }
 
-  // Time range
-  if (timeRangeResult.status === "fulfilled" && timeRangeResult.value) {
-    result.timeRange = timeRangeResult.value;
-    console.log(`[discover] Event time range: ${result.timeRange.min} → ${result.timeRange.max}`);
-  }
-
-  // Rate limit budget measurement
-  if (rateBudgetResult.status === "fulfilled" && rateBudgetResult.value) {
-    result.rateLimitBudget = rateBudgetResult.value;
-    const rb = result.rateLimitBudget;
-    console.log(`[discover] Rate limit budget - Header: ${rb.headerLimit}/${rb.headerWindow}s, Query: ${rb.queryLimit}/${rb.queryWindow}s, Separate: ${rb.separatePools}`);
-    // Update dual pool flag from budget measurement if budget says separate
-    if (rb.separatePools) {
-      result.dualRateLimitPools = true;
-    }
-  }
-
-  // Custom headers
-  if (customHeaderResult.status === "fulfilled" && customHeaderResult.value) {
-    result.customHeaders = customHeaderResult.value;
-    console.log(`[discover] Custom headers found: ${JSON.stringify(result.customHeaders)}`);
-  }
-
-  // SSE probe
-  if (sseResult.status === "fulfilled" && sseResult.value) {
-    result.sseWorks = true;
-    console.log("[discover] SSE endpoint (/events/sse) works!");
-  }
-
-  // Time param probe
-  if (timeParamResult.status === "fulfilled" && timeParamResult.value) {
-    result.timeParamWorks = timeParamResult.value.works;
-    result.timeParam = timeParamResult.value.param;
-    if (result.timeParamWorks) {
-      console.log(`[discover] Time-based filtering works (param: ${result.timeParam})`);
-    }
-  }
-
-  // Dashboard/JS bundle discovery
+  // Dashboard/JS bundle discovery (no auth needed for HTML/JS, only for /internal/stats)
   if (dashboardResult.status === "fulfilled" && dashboardResult.value) {
     const dash = dashboardResult.value;
     if (dash.discoveredEndpoints.length > 0) {
       console.log(`[discover] Dashboard discovered ${dash.discoveredEndpoints.length} endpoints`);
     }
-    // Update event types from stats if available
     if (dash.dataModelHints && (dash.dataModelHints as any).distributions?.eventTypes) {
       const statsTypes = ((dash.dataModelHints as any).distributions.eventTypes as Array<{ type: string; count: number }>)
         .map((et) => et.type)
@@ -379,25 +277,7 @@ export async function quickDiscover(): Promise<DiscoveryResult> {
     }
   }
 
-  // If we found a fast path, return early (skip cursor test)
-  if (result.allEndpoint || result.idsEndpoint || result.streamEndpoint || result.bulkEndpoint) {
-    return result;
-  }
-
-  // Test if parallel cursors give different data
-  try {
-    const [r1, r2] = await Promise.all([
-      fetchEvents(undefined, 10),
-      fetchEvents(undefined, 10),
-    ]);
-    result.parallelCursorsWork = r1.events.nextCursor !== r2.events.nextCursor;
-    if (result.parallelCursorsWork) {
-      console.log("[discover] Parallel cursors return different data - can use multi-chain strategy");
-    }
-  } catch {
-    // ignore
-  }
-
+  console.log("[discover] Discovery complete. Proceeding to ingestion.");
   return result;
 }
 
@@ -542,38 +422,32 @@ async function probeLimitAndTypeFilter(): Promise<{
   let typeFilterWorks = false;
   let typeFilterParam = "type";
 
-  const [limitResult, typeResult, eventTypeResult] = await Promise.allSettled([
-    fetchEvents(undefined, 5000),
-    fetchEvents(undefined, 10, { type: "page_view" }),
-    fetchEvents(undefined, 10, { eventType: "page_view" }),
-  ]);
-
-  if (limitResult.status === "fulfilled") {
-    const count = limitResult.value.events.data?.length || 0;
+  // Single call: test limit=5000 (known max from manual testing)
+  try {
+    const limitResult = await fetchEvents(undefined, 5000);
+    const count = limitResult.events.data?.length || 0;
     if (count >= 4500) {
       maxLimit = 5000;
-      // Aggressively probe larger page sizes — highest ROI optimization
-      for (const size of [10000, 20000, 50000, 100000]) {
-        try {
-          const big = await fetchEvents(undefined, size);
-          const bigCount = big.events.data?.length || 0;
-          if (bigCount >= size * 0.9) {
-            maxLimit = size;
-            console.log(`[discover] limit=${size} works! Got ${bigCount} events`);
-          } else {
-            console.log(`[discover] limit=${size} capped at ${bigCount}, stopping`);
-            break; // server capped it, no point going higher
-          }
-        } catch {
-          console.log(`[discover] limit=${size} failed, stopping`);
-          break;
-        }
-      }
+      console.log(`[discover] limit=5000 works! Got ${count} events`);
+    } else if (count > 1000) {
+      maxLimit = count;
+      console.log(`[discover] limit=5000 capped at ${count} events`);
     }
+
+    // Check if events have a type field (from the data we already fetched)
+    const data = limitResult.events.data || [];
+    if (data.length > 0 && data[0].type) {
+      // Verify type filtering works by checking if any event has a type field
+      console.log(`[discover] Events have "type" field — will test type filtering`);
+    }
+  } catch (err) {
+    console.log(`[discover] limit probe failed: ${String(err).substring(0, 100)}`);
   }
 
-  if (typeResult.status === "fulfilled") {
-    const data = typeResult.value.events.data || [];
+  // Test type filtering with a single request
+  try {
+    const typeResult = await fetchEvents(undefined, 10, { type: "page_view" });
+    const data = typeResult.events.data || [];
     if (data.length > 0) {
       const allMatch = data.every(
         (e: Record<string, unknown>) =>
@@ -582,22 +456,11 @@ async function probeLimitAndTypeFilter(): Promise<{
       if (allMatch) {
         typeFilterWorks = true;
         typeFilterParam = "type";
+        console.log(`[discover] Type filtering confirmed: ?type=page_view works`);
       }
     }
-  }
-
-  if (!typeFilterWorks && eventTypeResult.status === "fulfilled") {
-    const data = eventTypeResult.value.events.data || [];
-    if (data.length > 0) {
-      const allMatch = data.every(
-        (e: Record<string, unknown>) =>
-          e.type === "page_view" || e.eventType === "page_view" || e.event_type === "page_view"
-      );
-      if (allMatch) {
-        typeFilterWorks = true;
-        typeFilterParam = "eventType";
-      }
-    }
+  } catch {
+    // Type filtering not available
   }
 
   return { maxLimit, typeFilterWorks, typeFilterParam };
@@ -1058,11 +921,12 @@ async function probeDashboardAndBundle(): Promise<{
     console.log(`[discover] Dashboard fetch failed: ${String(err).substring(0, 100)}`);
   }
 
-  // 3. Deep inspection of /internal/stats — log ALL fields, look for data model hints
+  // 3. Deep inspection of /internal/stats — requires API key auth
   try {
+    const apiKey = getApiKey();
     const { statusCode, body: bodyStream } = await undiciRequest(`${hostBase}/internal/stats`, {
       method: "GET",
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", "X-API-Key": apiKey },
       headersTimeout: 10_000,
       bodyTimeout: 10_000,
     });

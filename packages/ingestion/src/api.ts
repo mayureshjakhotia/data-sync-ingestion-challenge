@@ -230,9 +230,9 @@ function logFirstRequest(
 
 function updateRateLimit(method: AuthMethod, info: RateLimitInfo): void {
   rateLimits[method].remaining = info.remaining;
-  // reset is seconds from epoch
+  // reset is seconds UNTIL reset (relative), not epoch timestamp
   if (info.reset > 0) {
-    rateLimits[method].resetAt = info.reset * 1000;
+    rateLimits[method].resetAt = Date.now() + info.reset * 1000;
   }
   if (info.retryAfter) {
     rateLimits[method].resetAt = Date.now() + info.retryAfter * 1000;
@@ -259,8 +259,8 @@ export function pickAuthMethod(preferred?: AuthMethod): AuthMethod {
   if (headerOk && !queryOk) return "header";
   if (queryOk && !headerOk) return "query";
   if (headerOk && queryOk) {
-    // Prefer header (better rate limits per CLAUDE.md)
-    return rateLimits.header.remaining >= rateLimits.query.remaining ? "header" : "query";
+    // Query auth has faster reset window (5/3s vs 10/60s), prefer it for throughput
+    return rateLimits.query.remaining >= rateLimits.header.remaining ? "query" : "header";
   }
 
   // Both exhausted - return whichever resets first
@@ -347,10 +347,12 @@ export async function apiRequest(
   } = {}
 ): Promise<ApiResult> {
   const method = options.method || "GET";
-  const maxRetries = 5;
+  const maxErrorRetries = 5; // Retry limit for real errors (5xx, network)
   let authMethod = options.authMethod || pickAuthMethod();
+  let errorAttempts = 0;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  // Infinite loop with separate counters for 429s (flow control) vs real errors
+  while (true) {
     const url = buildUrl(path, authMethod);
     const reqHeaders = buildHeaders(authMethod, options.headers, options.acceptHeader);
 
@@ -381,22 +383,16 @@ export async function apiRequest(
       }
 
       if (statusCode === 429) {
-        // Rate limited - try switching auth method
-        const otherMethod: AuthMethod = authMethod === "header" ? "query" : "header";
-        const otherOk = rateLimits[otherMethod].remaining > 1 || Date.now() >= rateLimits[otherMethod].resetAt;
-        // Consume the body
+        // 429 is flow control, NOT an error — don't count against retry limit
         await bodyStream.text();
-
-        if (otherOk) {
-          authMethod = otherMethod;
-          continue;
-        }
-
-        // Both exhausted, wait
-        const waitMs = Math.max((rateLimit.retryAfter || 1) * 1000, 200);
-        console.log(`[api] Rate limited (both methods). Waiting ${waitMs}ms (attempt ${attempt + 1})`);
+        const resetSeconds = rateLimit.retryAfter || rateLimit.reset || 3;
+        const waitMs = Math.max(resetSeconds * 1000, 500);
+        // Switch to other auth method on 429
+        const otherAuth: AuthMethod = authMethod === "header" ? "query" : "header";
+        console.log(`[api] 429 on ${authMethod} auth. Switching to ${otherAuth}, waiting ${(waitMs/1000).toFixed(1)}s`);
+        authMethod = otherAuth;
         await sleep(waitMs);
-        continue;
+        continue; // retry without incrementing error counter
       }
 
       const bodyText = await bodyStream.text();
@@ -404,23 +400,26 @@ export async function apiRequest(
       // Log full details for first few requests
       logFirstRequest(method, url, statusCode, rawHeaders, bodyText, authMethod);
 
-      if (statusCode >= 500 && attempt < maxRetries - 1) {
-        const waitMs = Math.min(1000 * Math.pow(2, attempt), 10000);
+      if (statusCode >= 500) {
+        errorAttempts++;
+        if (errorAttempts >= maxErrorRetries) {
+          throw new Error(`[api] Server error ${statusCode} after ${errorAttempts} retries`);
+        }
+        const waitMs = Math.min(1000 * Math.pow(2, errorAttempts), 10000);
         await sleep(waitMs);
         continue;
       }
 
       return { statusCode, headers: rawHeaders, body: bodyText, rateLimit, authMethod };
     } catch (err) {
-      if (attempt < maxRetries - 1) {
-        await sleep(1000 * (attempt + 1));
-        continue;
+      errorAttempts++;
+      if (errorAttempts >= maxErrorRetries) {
+        throw err;
       }
-      throw err;
+      await sleep(1000 * errorAttempts);
+      continue;
     }
   }
-
-  throw new Error(`[api] Max retries exceeded for ${method} ${path}`);
 }
 
 /**
@@ -516,12 +515,18 @@ export async function requestStreamAccess(): Promise<StreamAccessResult | null> 
   const url = `${hostBase}/internal/dashboard/stream-access`;
 
   try {
+    console.log(`[api] Requesting stream access from: ${url}`);
+
     const { statusCode, body: bodyStream } = await undiciRequest(url, {
       method: "POST",
       headers: {
         "X-API-Key": API_KEY,
         "Content-Type": "application/json",
-        Accept: "application/json",
+        Accept: "*/*",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36",
+        "X-Dashboard-Session": "true",
+        "Origin": "http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com",
+        "Referer": "http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/",
       },
       dispatcher: agent,
       headersTimeout: 30_000,
@@ -572,6 +577,8 @@ export async function fetchStream(
   const reqHeaders: Record<string, string> = {
     Accept: "application/json",
     "X-API-Key": API_KEY,
+    "Cookie": `path=/; dashboard_api_key=${API_KEY}`,
+    "Referer": "http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/docs/api.md",
   };
   if (token && tokenHeader) {
     reqHeaders[tokenHeader] = token;
